@@ -1,10 +1,9 @@
-
+```groovy
 pipeline {
     agent any
 
     environment {
         VENV_DIR = 'venv'
-        API_PORT = '5000'
     }
 
     options {
@@ -15,100 +14,84 @@ pipeline {
 
         stage('Checkout') {
             steps {
-                echo 'Checking out source code...'
                 checkout scm
             }
         }
 
-        stage('Python Environment') {
+        stage('Set Up Python Environment') {
             steps {
-                echo 'Creating Python virtual environment...'
-
                 bat '''
-                    python --version
-                    python -m venv %VENV_DIR%
-                    call %VENV_DIR%\\Scripts\\activate.bat
+                    echo Creating Python virtual environment...
 
-                    python -m pip install --upgrade pip
-                    python -m pip install -r requirements.txt
-                    python -m pip install requests
+                    if exist "%VENV_DIR%" (
+                        echo Removing existing virtual environment...
+                        rmdir /s /q "%VENV_DIR%"
+                    )
+
+                    python -m venv "%VENV_DIR%"
+
+                    echo Upgrading pip...
+                    "%VENV_DIR%\\Scripts\\python.exe" -m pip install --upgrade pip
+
+                    echo Installing requirements...
+                    "%VENV_DIR%\\Scripts\\python.exe" -m pip install -r requirements.txt
+
+                    echo Installing requests...
+                    "%VENV_DIR%\\Scripts\\python.exe" -m pip install requests
                 '''
             }
         }
 
         stage('Train Model') {
             steps {
-                echo 'Training ML model...'
-
                 bat '''
-                    call %VENV_DIR%\\Scripts\\activate.bat
+                    echo Training model...
 
-                    python train_model.py
-
-                    if not exist house_model.pkl (
-                        echo ERROR: house_model.pkl was not created.
-                        exit /b 1
-                    )
-
-                    echo Model training completed successfully.
-                    dir house_model.pkl
+                    "%VENV_DIR%\\Scripts\\python.exe" train_model.py
                 '''
             }
         }
 
         stage('Start API & Smoke Test') {
             steps {
-                echo 'Starting API...'
-
                 bat '''
-                    call %VENV_DIR%\\Scripts\\activate.bat
-
                     echo Starting Flask API...
 
-                    start "" /B cmd /C "python app.py > app.log 2>&1"
+                    start "FlaskAPI" /B cmd /c ""%VENV_DIR%\\Scripts\\python.exe" app.py > app.log 2>&1"
 
                     echo Waiting for API to become ready...
 
                     set READY=0
 
                     for /L %%i in (1,1,30) do (
-                        powershell -NoProfile -Command "try { Invoke-WebRequest -Uri http://127.0.0.1:%API_PORT%/ -UseBasicParsing -TimeoutSec 2 | Out-Null; exit 0 } catch { exit 1 }"
+                        powershell -Command "try { $response = Invoke-WebRequest -Uri 'http://127.0.0.1:5000/' -UseBasicParsing -TimeoutSec 2; if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) { exit 0 } else { exit 1 } } catch { exit 1 }"
 
                         if not errorlevel 1 (
                             set READY=1
-                            echo API is UP.
-                            goto API_READY
+                            echo API is up.
+                            goto :API_READY
                         )
 
-                        echo API not ready yet... attempt %%i/30
+                        echo Waiting... %%i/30
                         timeout /t 1 /nobreak >nul
                     )
 
                     :API_READY
 
                     if "%READY%"=="0" (
-                        echo ERROR: API did not start within 30 seconds.
+                        echo API did not start in time.
                         echo.
-                        echo ================= APP LOG =================
-                        if exist app.log type app.log
-                        echo ============================================
+                        echo ===== app.log =====
+                        if exist app.log (
+                            type app.log
+                        )
+                        echo ===================
                         exit /b 1
                     )
 
-                    echo.
-                    echo API started successfully.
                     echo Running prediction smoke test...
-                    echo.
 
-                    python test_prediction.py
-
-                    if errorlevel 1 (
-                        echo ERROR: Prediction smoke test failed.
-                        exit /b 1
-                    )
-
-                    echo.
-                    echo Prediction smoke test completed successfully.
+                    "%VENV_DIR%\\Scripts\\python.exe" test_prediction.py
                 '''
             }
         }
@@ -117,55 +100,38 @@ pipeline {
     post {
 
         always {
-            echo 'Saving application log and cleaning API process...'
-
             bat '''
-                echo Checking API process on port %API_PORT%...
-
-                powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort %API_PORT% -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique; if ($p) { Write-Host 'Stopping API process:' $p; Stop-Process -Id $p -Force -ErrorAction SilentlyContinue } else { Write-Host 'No API process found on port %API_PORT%.' }"
-
                 echo.
-                echo ================= APP LOG =================
+                echo ===== Cleaning up Flask API =====
 
-                if exist app.log (
-                    type app.log
-                ) else (
-                    echo app.log was not created.
-                )
+                powershell -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*app.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
 
-                echo ============================================
+                echo API cleanup completed.
             '''
 
-            archiveArtifacts artifacts: 'house_model.pkl, app.log', allowEmptyArchive: true
+            archiveArtifacts artifacts: 'house_model.pkl, app.log',
+                             allowEmptyArchive: true
         }
 
         success {
-            echo '=============================================='
-            echo 'BUILD SUCCESS'
-            echo 'Model training completed.'
-            echo 'API smoke test completed.'
-            echo '=============================================='
+            echo 'Build, train, and smoke test succeeded.'
         }
 
         failure {
-            echo '=============================================='
-            echo 'BUILD FAILED'
-            echo 'Please check the console output and app.log.'
-            echo '=============================================='
+            echo 'Pipeline failed — check app.log and the Jenkins console output for details.'
         }
 
         cleanup {
-            echo 'Removing Python virtual environment...'
-
             bat '''
+                echo Removing Python virtual environment...
+
                 if exist "%VENV_DIR%" (
-                    rmdir /S /Q "%VENV_DIR%"
-                    echo Virtual environment removed.
-                ) else (
-                    echo Virtual environment does not exist.
+                    rmdir /s /q "%VENV_DIR%"
                 )
+
+                echo Cleanup completed.
             '''
         }
     }
 }
-
+```
