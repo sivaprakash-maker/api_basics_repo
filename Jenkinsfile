@@ -6,7 +6,7 @@ pipeline {
     }
 
     options {
-        timestamps()
+        
         disableConcurrentBuilds()
     }
 
