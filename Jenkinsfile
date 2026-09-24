@@ -1,4 +1,3 @@
-```groovy
 pipeline {
     agent any
 
@@ -7,87 +6,90 @@ pipeline {
     }
 
     options {
+        
         disableConcurrentBuilds()
     }
 
     stages {
-
         stage('Checkout') {
             steps {
-                echo 'Checking out source code...'
                 checkout scm
             }
         }
 
-        stage('Create Virtual Environment') {
+        stage('Set Up Python Environment') {
             steps {
-                bat '''
-                    if not exist "%VENV_DIR%\\Scripts\\python.exe" (
-                        python -m venv "%VENV_DIR%"
-                    )
-                '''
-            }
-        }
-
-        stage('Install Dependencies') {
-            steps {
-                bat '''
-                    "%VENV_DIR%\\Scripts\\python.exe" -m pip install --upgrade pip
-                    "%VENV_DIR%\\Scripts\\python.exe" -m pip install -r requirements.txt
+                sh '''
+                    python3 -m venv ${VENV_DIR}
+                    . ${VENV_DIR}/bin/activate
+                    pip install --upgrade pip
+                    pip install -r requirements.txt
+                    pip install requests
                 '''
             }
         }
 
         stage('Train Model') {
             steps {
-                echo 'Training ML model...'
-
-                bat '''
-                    "%VENV_DIR%\\Scripts\\python.exe" train_model.py
+                sh '''
+                    . ${VENV_DIR}/bin/activate
+                    python train_model.py
                 '''
             }
         }
 
-        stage('Start API') {
+        stage('Start API & Smoke Test') {
             steps {
-                echo 'Starting API...'
+                sh '''
+                    . ${VENV_DIR}/bin/activate
 
-                bat '''
-                    start "Jenkins API" /B "%VENV_DIR%\\Scripts\\python.exe" app.py
-                    timeout /t 10 /nobreak
-                '''
-            }
-        }
+                    nohup python app.py > app.log 2>&1 &
+                    echo $! > app.pid
 
-        stage('Test API') {
-            steps {
-                echo 'Testing API...'
+                    echo "Waiting for API to become ready..."
+                    ready=0
+                    for i in $(seq 1 30); do
+                        if curl -s -o /dev/null http://127.0.0.1:5000/; then
+                            ready=1
+                            echo "API is up"
+                            break
+                        fi
+                        sleep 1
+                    done
 
-                bat '''
-                    "%VENV_DIR%\\Scripts\\python.exe" test_prediction.py
+                    if [ "$ready" -ne 1 ]; then
+                        echo "API did not start in time"
+                        cat app.log || true
+                        exit 1
+                    fi
+
+                    python test_prediction.py
                 '''
             }
         }
     }
 
     post {
-
-        success {
-            echo '=========================================='
-            echo ' Jenkins Pipeline Completed Successfully'
-            echo '=========================================='
-        }
-
-        failure {
-            echo '=========================================='
-            echo ' Jenkins Pipeline Failed'
-            echo ' Check the Console Output'
-            echo '=========================================='
-        }
-
         always {
-            echo 'Pipeline execution completed.'
+            sh '''
+                if [ -f app.pid ]; then
+                    kill "$(cat app.pid)" 2>/dev/null || true
+                    rm -f app.pid
+                fi
+                # Flask's debug-mode reloader forks a child process; make sure
+                # nothing is left listening on the API port.
+                fuser -k 5000/tcp 2>/dev/null || true
+            '''
+            archiveArtifacts artifacts: 'house_model.pkl, app.log', allowEmptyArchive: true
+        }
+        success {
+            echo 'Build, train, and smoke test succeeded.'
+        }
+        failure {
+            echo 'Pipeline failed — check app.log and the console output above for details.'
+        }
+        cleanup {
+            sh 'rm -rf ${VENV_DIR}'
         }
     }
 }
-```
